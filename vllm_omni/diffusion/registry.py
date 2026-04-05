@@ -18,6 +18,11 @@ logger = init_logger(__name__)
 
 _DIFFUSION_MODELS = {
     # arch:(mod_folder, mod_relname, cls_name)
+    "RedMediaImageSRPipeline": (
+        "redmedia_image_sr",
+        "pipeline_redmedia_image_sr",
+        "RedMediaImageSRPipeline",
+    ),
     "QwenImagePipeline": (
         "qwen_image",
         "pipeline_qwen_image",
@@ -345,6 +350,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     # arch: post_process_func
     # `post_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
     # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
+    "RedMediaImageSRPipeline": "get_qwen_image_post_process_func",
     "QwenImagePipeline": "get_qwen_image_post_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_post_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_post_process_func",

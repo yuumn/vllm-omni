@@ -26,10 +26,10 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import DistributedAutoencoderKLQwenImage
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.qwen_image.cfg_parallel import (
-    QwenImageCFGParallelMixin,
+from vllm_omni.diffusion.models.redmedia_image_sr.cfg_parallel import (
+    RedMediaImageSRCFGParallelMixin,
 )
-from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
+from vllm_omni.diffusion.models.redmedia_image_sr.redmedia_image_sr_transformer import (
     QwenImageTransformer2DModel,
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
@@ -241,7 +241,7 @@ def apply_rotary_emb_qwen(
         return x_out.type_as(x)
 
 
-class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineProfilerMixin):
+class RedMediaImageSRPipeline(nn.Module, RedMediaImageSRCFGParallelMixin, DiffusionPipelineProfilerMixin):
     supports_step_execution: ClassVar[bool] = True
 
     def __init__(
@@ -251,6 +251,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         prefix: str = "",
     ):
         super().__init__()
+        # print(f"od_config: {od_config}")
         self.od_config = od_config
         self.parallel_config = od_config.parallel_config
         self.weights_sources = [
