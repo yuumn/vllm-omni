@@ -1422,11 +1422,16 @@ async def edit_images(
     # vllm-omni extension for layered models (e.g., Qwen-Image-Layered)
     layers: int | None = Form(None),
     resolution: int | None = Form(None),  # See SUPPORTED_LAYERED_RESOLUTIONS
+    scale: float | None = Form(None),
+    fidelity: float | None = Form(None),
 ) -> ImageGenerationResponse:
     """
     OpenAI-compatible image edit endpoint.
     """
     # 1. get engine and model
+    print(f"raw_request: {raw_request}")
+    print(f"scale: {scale}")
+    print(f"fidelity: {fidelity}")
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
     if model is not None and model != model_name:
         logger.warning(
@@ -1446,6 +1451,14 @@ async def edit_images(
             prompt["negative_prompt"] = negative_prompt
         input_images_list = []
         images = image or image_array
+        # if isinstance(images, list):
+        #     images = images[0]
+        
+        # contents = await images.read()
+        # images = Image.open(io.BytesIO(contents))
+        # print(f"images: {images} {type(images)}")
+        # if not isinstance(images, list):
+        #     images = [images]
         urls = url or url_array
         if images:
             input_images_list.extend(images)
@@ -1461,6 +1474,13 @@ async def edit_images(
             )
         prompt["multi_modal_data"] = {}
         prompt["multi_modal_data"]["image"] = pil_images
+        if scale is None:
+            scale = 1.0
+        if fidelity is None:
+            fidelity = 1.0
+        prompt["multi_modal_data"]["scale"] = scale
+        prompt["multi_modal_data"]["fidelity"] = fidelity
+        # prompt["multi_modal_data"]["image"] = images
 
         # 3 Build sample params
         gen_params = OmniDiffusionSamplingParams()
@@ -1553,6 +1573,8 @@ async def edit_images(
         _update_if_not_none(gen_params, "generator_device", generator_device)
         _update_if_not_none(gen_params, "layers", layers)
         _update_if_not_none(gen_params, "resolution", resolution)
+        _update_if_not_none(gen_params, "scale", scale)
+        _update_if_not_none(gen_params, "fidelity", fidelity)
 
         # 4. Generate images using AsyncOmni (multi-stage mode)
         request_id = f"img_edit-{random_uuid()}"

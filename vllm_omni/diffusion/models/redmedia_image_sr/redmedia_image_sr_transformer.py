@@ -46,6 +46,7 @@ from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
+
 logger = init_logger(__name__)
 
 
@@ -431,6 +432,7 @@ class ColumnParallelApproxGELU(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        """dual lora"""
         self.proj = ColumnParallelLinear(
             dim_in,
             dim_out,
@@ -466,6 +468,7 @@ class FeedForward(nn.Module):
         inner_dim = inner_dim or int(dim * mult)
         dim_out = dim_out or dim
 
+        """dual lora"""
         layers: list[nn.Module] = [
             ColumnParallelApproxGELU(
                 dim, inner_dim, approximate="tanh", bias=bias, quant_config=quant_config, prefix=prefix
@@ -515,12 +518,14 @@ class QwenImageCrossAttention(nn.Module):
         self.qk_norm = qk_norm
         self.eps = eps
 
+        """dual lora"""
         self.to_qkv = QKVParallelLinear(
             hidden_size=dim,
             head_size=self.head_dim,
             total_num_heads=num_heads,
             quant_config=quant_config,
             prefix="to_qkv",
+            return_bias=False
         )
         self.query_num_heads = self.to_qkv.num_heads
         self.kv_num_heads = self.to_qkv.num_kv_heads
@@ -553,6 +558,7 @@ class QwenImageCrossAttention(nn.Module):
         )
 
         assert not pre_only
+        """dual lora"""
         self.to_out = RowParallelLinear(
             self.inner_dim,
             self.dim,
@@ -590,7 +596,8 @@ class QwenImageCrossAttention(nn.Module):
         hidden_states_mask: torch.Tensor | None = None,
         encoder_hidden_states_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        img_qkv, _ = self.to_qkv(hidden_states)
+        # img_qkv, _ = self.to_qkv(hidden_states)
+        img_qkv = self.to_qkv(hidden_states)
         q_size = self.query_num_heads * self.head_dim
         kv_size = self.kv_num_heads * self.head_dim
         img_query, img_key, img_value = img_qkv.split([q_size, kv_size, kv_size], dim=-1)
@@ -702,6 +709,7 @@ class QwenImageTransformerBlock(nn.Module):
         self.attention_head_dim = attention_head_dim
 
         # Image processing modules
+        """dual lora"""
         self.img_mod = nn.Sequential(
             nn.SiLU(),
             ReplicatedLinear(
@@ -958,6 +966,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
 
         self.txt_norm = RMSNorm(joint_attention_dim, eps=1e-6)
 
+        """dual lora"""
         self.img_in = ReplicatedLinear(
             in_channels,
             self.inner_dim,

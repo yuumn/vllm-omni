@@ -250,3 +250,4 @@ vllm_omni/_version.py
 
 models/RedMedia-Image-SR-1.0/
 sr_visual_results/
+output/

@@ -350,7 +350,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     # arch: post_process_func
     # `post_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
     # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
-    "RedMediaImageSRPipeline": "get_qwen_image_post_process_func",
+    "RedMediaImageSRPipeline": "get_qwen_image_edit_plus_post_process_func",
     "QwenImagePipeline": "get_qwen_image_post_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_post_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_post_process_func",
@@ -387,6 +387,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     # arch: pre_process_func
     # `pre_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
     # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
+    "RedMediaImageSRPipeline": "get_qwen_image_edit_plus_pre_process_func",
     "GlmImagePipeline": "get_glm_image_pre_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_pre_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_pre_process_func",

@@ -8,9 +8,11 @@ import logging
 import math
 import os
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import numpy as np
+import PIL.Image
+from PIL import Image
 import torch
 import torch.distributed
 from diffusers.image_processor import VaeImageProcessor
@@ -29,6 +31,22 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.redmedia_image_sr.cfg_parallel import (
     RedMediaImageSRCFGParallelMixin,
 )
+
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
+from vllm_omni.diffusion.models.redmedia_image_sr.dual_lora_linear import DualLoRALinear, LinearFP8Wrapper, DualLoRAQKVLinear
+
+from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import calculate_shift
+from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit import (
+    calculate_dimensions,
+    retrieve_latents,
+    retrieve_timesteps,
+)
+
 from vllm_omni.diffusion.models.redmedia_image_sr.redmedia_image_sr_transformer import (
     QwenImageTransformer2DModel,
 )
@@ -42,13 +60,111 @@ if TYPE_CHECKING:
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
-
+from copy import deepcopy
+from vllm_omni.diffusion.models.redmedia_image_sr.odtsr.generator import Generator
+from vllm_omni.diffusion.models.redmedia_image_sr.odtsr.wavelet_color_fix import adain_color_fix, wavelet_color_fix
 logger = logging.getLogger(__name__)
 
 
-def get_qwen_image_post_process_func(
+# def get_qwen_image_post_process_func(
+#     od_config: OmniDiffusionConfig,
+# ):
+#     model_name = od_config.model
+#     if os.path.exists(model_name):
+#         model_path = model_name
+#     else:
+#         model_path = download_weights_from_hf_specific(model_name, None, ["*"])
+#     vae_config_path = os.path.join(model_path, "vae/config.json")
+#     with open(vae_config_path) as f:
+#         vae_config = json.load(f)
+#         vae_scale_factor = 2 ** len(vae_config["temporal_downsample"]) if "temporal_downsample" in vae_config else 8
+
+#     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
+
+#     # def post_process_func(
+#     #     images: torch.Tensor,
+#     # ):
+#     #     return image_processor.postprocess(images)
+#     def pre_process_func(
+#         request: OmniDiffusionRequest,
+#     ):
+#         """Pre-process requests for QwenImageEditPlusPipeline."""
+#         for i, prompt in enumerate(request.prompts):
+#             multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
+#             raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+#             if isinstance(prompt, str):
+#                 prompt = OmniTextPrompt(prompt=prompt)
+#             if "additional_information" not in prompt:
+#                 prompt["additional_information"] = {}
+
+#             # Handle single image or list of images
+#             if raw_image is None:
+#                 continue
+
+#             if not isinstance(raw_image, list):
+#                 raw_image = [raw_image]
+#             image = [
+#                 PIL.Image.open(im) if isinstance(im, str) else cast(PIL.Image.Image | np.ndarray | torch.Tensor, im)
+#                 for im in raw_image
+#             ]
+
+#             # Calculate dimensions based on first image
+#             image_size = image[0].size
+#             calculated_width, calculated_height = calculate_dimensions(VAE_IMAGE_SIZE, image_size[0] / image_size[1])
+#             height = request.sampling_params.height or calculated_height
+#             width = request.sampling_params.width or calculated_width
+
+#             # Ensure dimensions are multiples of vae_scale_factor * 2
+#             multiple_of = vae_scale_factor * 2
+#             height = height // multiple_of * multiple_of
+#             width = width // multiple_of * multiple_of
+
+#             # Store calculated dimensions in request
+#             prompt["additional_information"]["calculated_height"] = calculated_height
+#             prompt["additional_information"]["calculated_width"] = calculated_width
+#             request.sampling_params.height = height
+#             request.sampling_params.width = width
+
+#             # Preprocess images into condition_images (for prompt encoding) and vae_images (for VAE encoding)
+#             condition_images = []
+#             vae_images = []
+#             condition_image_sizes = []
+#             vae_image_sizes = []
+
+#             for img in image:
+#                 if isinstance(img, torch.Tensor) and len(img.shape) > 1 and img.shape[1] == latent_channels:
+#                     # Already a latent tensor
+#                     continue
+
+#                 image_width, image_height = img.size
+#                 condition_width, condition_height = calculate_dimensions(
+#                     CONDITION_IMAGE_SIZE, image_width / image_height
+#                 )
+#                 vae_width, vae_height = calculate_dimensions(VAE_IMAGE_SIZE, image_width / image_height)
+
+#                 condition_image_sizes.append((condition_width, condition_height))
+#                 vae_image_sizes.append((vae_width, vae_height))
+
+#                 condition_images.append(image_processor.resize(img, condition_height, condition_width))
+#                 vae_images.append(image_processor.preprocess(img, vae_height, vae_width).unsqueeze(2))
+
+#             # Store preprocessed images in request
+#             prompt["additional_information"]["condition_images"] = condition_images
+#             prompt["additional_information"]["vae_images"] = vae_images
+#             prompt["additional_information"]["condition_image_sizes"] = condition_image_sizes
+#             prompt["additional_information"]["vae_image_sizes"] = vae_image_sizes
+#             request.prompts[i] = prompt
+#         return request
+
+#     return pre_process_func
+
+CONDITION_IMAGE_SIZE = 384 * 384
+VAE_IMAGE_SIZE = 1024 * 1024
+
+def get_qwen_image_edit_plus_pre_process_func(
     od_config: OmniDiffusionConfig,
 ):
+    """Pre-processing function for QwenImageEditPlusPipeline."""
     model_name = od_config.model
     if os.path.exists(model_name):
         model_path = model_name
@@ -59,7 +175,99 @@ def get_qwen_image_post_process_func(
         vae_config = json.load(f)
         vae_scale_factor = 2 ** len(vae_config["temporal_downsample"]) if "temporal_downsample" in vae_config else 8
 
-    image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
+    image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2, do_convert_rgb=True)
+    latent_channels = vae_config.get("z_dim", 16)
+
+    def pre_process_func(
+        request: OmniDiffusionRequest,
+    ):
+        """Pre-process requests for QwenImageEditPlusPipeline."""
+        for i, prompt in enumerate(request.prompts):
+            multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
+            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+            if isinstance(prompt, str):
+                prompt = OmniTextPrompt(prompt=prompt)
+            if "additional_information" not in prompt:
+                prompt["additional_information"] = {}
+
+            # Handle single image or list of images
+            if raw_image is None:
+                print(f"raw_image is None")
+                continue
+
+            if not isinstance(raw_image, list):
+                raw_image = [raw_image]
+            image = [
+                PIL.Image.open(im) if isinstance(im, str) else cast(PIL.Image.Image | np.ndarray | torch.Tensor, im)
+                for im in raw_image
+            ]
+
+            # Calculate dimensions based on first image
+            image_size = image[0].size
+            calculated_width, calculated_height = calculate_dimensions(VAE_IMAGE_SIZE, image_size[0] / image_size[1])
+            height = request.sampling_params.height or calculated_height
+            width = request.sampling_params.width or calculated_width
+
+            # Ensure dimensions are multiples of vae_scale_factor * 2
+            multiple_of = vae_scale_factor * 2
+            height = height // multiple_of * multiple_of
+            width = width // multiple_of * multiple_of
+
+            # Store calculated dimensions in request
+            prompt["additional_information"]["calculated_height"] = calculated_height
+            prompt["additional_information"]["calculated_width"] = calculated_width
+            request.sampling_params.height = height
+            request.sampling_params.width = width
+
+            # Preprocess images into condition_images (for prompt encoding) and vae_images (for VAE encoding)
+            condition_images = []
+            vae_images = []
+            condition_image_sizes = []
+            vae_image_sizes = []
+
+            for img in image:
+                if isinstance(img, torch.Tensor) and len(img.shape) > 1 and img.shape[1] == latent_channels:
+                    # Already a latent tensor
+                    continue
+
+                image_width, image_height = img.size
+                condition_width, condition_height = calculate_dimensions(
+                    CONDITION_IMAGE_SIZE, image_width / image_height
+                )
+                vae_width, vae_height = calculate_dimensions(VAE_IMAGE_SIZE, image_width / image_height)
+
+                condition_image_sizes.append((condition_width, condition_height))
+                vae_image_sizes.append((vae_width, vae_height))
+
+                condition_images.append(image_processor.resize(img, condition_height, condition_width))
+                vae_images.append(image_processor.preprocess(img, vae_height, vae_width).unsqueeze(2))
+
+            # Store preprocessed images in request
+            prompt["additional_information"]["condition_images"] = condition_images
+            prompt["additional_information"]["vae_images"] = vae_images
+            prompt["additional_information"]["condition_image_sizes"] = condition_image_sizes
+            prompt["additional_information"]["vae_image_sizes"] = vae_image_sizes
+            request.prompts[i] = prompt
+        return request
+
+    return pre_process_func
+
+
+def get_qwen_image_edit_plus_post_process_func(
+    od_config: OmniDiffusionConfig,
+):
+    """Post-processing function for QwenImageEditPlusPipeline."""
+    model_name = od_config.model
+    if os.path.exists(model_name):
+        model_path = model_name
+    else:
+        model_path = download_weights_from_hf_specific(model_name, None, ["*"])
+    vae_config_path = os.path.join(model_path, "vae/config.json")
+    with open(vae_config_path) as f:
+        vae_config = json.load(f)
+        vae_scale_factor = 2 ** len(vae_config["temporal_downsample"]) if "temporal_downsample" in vae_config else 8
+
+    image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2, do_convert_rgb=True)
 
     def post_process_func(
         images: torch.Tensor,
@@ -67,7 +275,6 @@ def get_qwen_image_post_process_func(
         return image_processor.postprocess(images)
 
     return post_process_func
-
 
 def calculate_shift(
     image_seq_len,
@@ -251,7 +458,15 @@ class RedMediaImageSRPipeline(nn.Module, RedMediaImageSRCFGParallelMixin, Diffus
         prefix: str = "",
     ):
         super().__init__()
-        # print(f"od_config: {od_config}")
+
+        self.od_config = od_config
+
+        
+
+
+
+        """
+        print(f"od_config: {od_config}")
         self.od_config = od_config
         self.parallel_config = od_config.parallel_config
         self.weights_sources = [
@@ -283,6 +498,13 @@ class RedMediaImageSRPipeline(nn.Module, RedMediaImageSRCFGParallelMixin, Diffus
             od_config=od_config, quant_config=od_config.quantization_config, **transformer_kwargs
         )
 
+        # self.new_vae = deepcopy(self.vae)
+        # self.unfrozen(self.new_vae.encoder, type(self.new_vae.encoder.conv_in))
+        self.new_vae = DistributedAutoencoderKLQwenImage.from_pretrained(
+            model, subfolder="vae", local_files_only=local_files_only
+        ).to(self.device)
+        
+
         self.tokenizer = Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
 
         self.stage = None
@@ -302,6 +524,91 @@ class RedMediaImageSRPipeline(nn.Module, RedMediaImageSRCFGParallelMixin, Diffus
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
+        """
+
+    
+    
+    def add_custom_dual_lora(self, model, lora_rank):
+        patterns = [
+            "img_in",
+            "img_mod.1",
+            # "attn.to_q",
+            # "attn.to_k",
+            # "attn.to_v",
+            "attn.to_qkv", # ?
+            "to_out", # ?
+            "img_mlp.net.0.proj",
+            "img_mlp.net.2",
+        ]
+        self.replace_linear_with_duallora(model, patterns, rank=lora_rank, alpha1=0, alpha2=lora_rank, use_fp8=True)
+
+    def replace_linear_with_duallora(self, model, patterns, rank, alpha1, alpha2, use_fp8=False):
+        """
+        先冻结model所有参数，
+        将匹配patterns的nn.Linear替换为DualLoRALinear
+        不匹配的替换为 LinearFP8Wrapper
+        """
+        def to_fp8(tensor):
+            # 仅在 use_fp8 时转换
+            if use_fp8:
+                return tensor.to(dtype=torch.float8_e4m3fn)
+            return tensor
+
+        # # 冻结全部参数
+        # for p in model.parameters():
+        #     p.requires_grad = False
+
+        def _replace_module(parent, name_prefix=""):
+            for name, module in list(parent.named_children()):
+                full_name = f"{name_prefix}{name}"
+                if isinstance(module, ColumnParallelLinear) or isinstance(module, ReplicatedLinear) or isinstance(module, RowParallelLinear) or isinstance(module, QKVParallelLinear):
+                    module.weight.data = to_fp8(module.weight.data)
+                    if module.bias is not None:
+                        module.bias.data = to_fp8(module.bias.data)
+
+                    if any(p in full_name for p in patterns):
+                        if "attn.to_qkv" in full_name:
+                            # 替换为 DualLoRALinear
+                            new_module = DualLoRAQKVLinear(module, rank, alpha1, alpha2)
+                            setattr(parent, name, new_module)
+                            print(f"[lora] {full_name} -> DualLoRAQKVLinear")
+                            
+                        else:
+                            # 替换为 DualLoRALinear
+                            new_module = DualLoRALinear(module, rank, alpha1, alpha2)
+                            setattr(parent, name, new_module)
+                            print(f"[lora] {full_name} -> DualLoRALinear")
+                    else: 
+                        # 替换为自动精度转换的 FP8LinearWrapper
+                        new_module = LinearFP8Wrapper(module)
+                        setattr(parent, name, new_module)
+                        print(f"[cast] {full_name} -> LinearFP8Wrapper (fp8={use_fp8})")
+                # elif isinstance(module, QKVParallelLinear):
+                #     module.weight.data = to_fp8(module.weight.data)
+                #     if module.bias is not None:
+                #         module.bias.data = to_fp8(module.bias.data)
+
+                #     if any(p in full_name for p in patterns):
+                #         # 替换为 DualLoRALinear
+                #         new_module = DualLoRAQKVLinear(module, rank, alpha1, alpha2)
+                #         setattr(parent, name, new_module)
+                #         print(f"[lora] {full_name} -> DualLoRAQKVLinear")
+                #     else: 
+                #         # 替换为自动精度转换的 FP8LinearWrapper
+                #         new_module = LinearFP8Wrapper(module)
+                #         setattr(parent, name, new_module)
+                #         print(f"[cast] {full_name} -> LinearFP8Wrapper (fp8={use_fp8})")
+
+                else:
+                    _replace_module(module, name_prefix=full_name + ".")
+        
+        _replace_module(model)
+    # def unfrozen(self, model, target_cls):
+    #     for name, module in model.named_modules():
+    #         # time_conv单帧用不到 在不开启find_unused_parameters的情况下会报错
+    #         if isinstance(module, target_cls) and 'time_conv' not in name:
+    #             for p in module.parameters():
+    #                 p.requires_grad = True
 
     def check_inputs(
         self,
@@ -910,12 +1217,48 @@ class RedMediaImageSRPipeline(nn.Module, RedMediaImageSRCFGParallelMixin, Diffus
         output_type = kwargs.get("output_type", "pil")
 
         return self._decode_latents(state.latents, height, width, output_type)
+    
+    def infer(
+        self, 
+        prompt,
+        negative_prompt,
+        upsampled_img,
+        condition_image, # already paded
+        cfg_scale,
+        fidelity,
+        tiled,
+        tile_size,
+        tile_stride,
+        w_desti,
+        h_desti
+    ) -> DiffusionOutput:
+
+        with torch.inference_mode():
+            res_img = self.model.infer(
+                prompt = prompt,
+                negative_prompt = negative_prompt,
+                condition_image = condition_image,
+                cfg_scale = cfg_scale,
+                fidelity = fidelity,
+                tiled = tiled,
+                tile_size = tile_size,
+                tile_stride = tile_stride
+            )
+            print(f"res_img: {res_img.shape}")
+            cropped_image = res_img[:, :, :h_desti, :w_desti]
+            output_pil = wavelet_color_fix(target=cropped_image, source=upsampled_img, return_type="Tensor")
+
+        return DiffusionOutput(
+            output=output_pil,
+            stage_durations=None,
+        )
 
     def forward(
         self,
         req: OmniDiffusionRequest,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
+        image: PIL.Image.Image | list[PIL.Image.Image] | torch.Tensor | None = None,
         true_cfg_scale: float = 4.0,
         height: int | None = None,
         width: int | None = None,
@@ -934,70 +1277,245 @@ class RedMediaImageSRPipeline(nn.Module, RedMediaImageSRCFGParallelMixin, Diffus
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         max_sequence_length: int = 512,
     ) -> DiffusionOutput:
-        # assert False
+        # print(f"image: {image}")
+        # print(f"req: {req}")
+        multi_modal_data = req.prompts[0].get("multi_modal_data", None)
+        image = None
+        scale = None
+        fidelity = None
+        if multi_modal_data is not None:
+            if isinstance(multi_modal_data, list):
+                multi_modal_data = multi_modal_data[0]
+            if "image" in multi_modal_data.keys():
+                image = multi_modal_data["image"]
+            if "scale" in multi_modal_data.keys():
+                scale = multi_modal_data["scale"]
+                # print(f"scale: {scale}")
+            if "fidelity" in multi_modal_data.keys():
+                fidelity = multi_modal_data["fidelity"]
+                # print(f"fidelity: {fidelity}")
+            if isinstance(image, list):
+                image = image[0]
+        
+        # image = multi_modal_data[0]
         extracted_prompt, negative_prompt = self._extract_prompts(req.prompts)
         prompt = extracted_prompt or prompt
+        print(f"prompt: {prompt}")
 
-        height = req.sampling_params.height or self.default_sample_size * self.vae_scale_factor
-        width = req.sampling_params.width or self.default_sample_size * self.vae_scale_factor
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
-        sigmas = req.sampling_params.sigmas or sigmas
-        max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
-        generator = req.sampling_params.generator or generator
-        true_cfg_scale = req.sampling_params.true_cfg_scale or true_cfg_scale
-        if req.sampling_params.guidance_scale_provided:
-            guidance_scale = req.sampling_params.guidance_scale
-        num_images_per_prompt = (
-            req.sampling_params.num_outputs_per_prompt
-            if req.sampling_params.num_outputs_per_prompt > 0
-            else num_images_per_prompt
-        )
+        print(f"image: {image} {type(image)}")
+        print(f"scale: {scale}")
+        print(f"fidelity: {fidelity}")
+        if image is None:
+            return DiffusionOutput(
+                output=None,
+                stage_durations=None,
+            )
 
-        ctx = self._prepare_generation_context(
+        tilesize = 64
+        tile_stride = tilesize - tilesize // 4
+        
+        img = image.convert('RGB')
+        w,h = img.size
+        w_desti = round(w * scale)
+        h_desti = round(h * scale)
+        upsampled_img = img.resize((w_desti, h_desti), Image.BICUBIC)
+
+        def adaptive_pad(img, tilesize, stride):
+            w, h = img.size
+            pad_h = (tilesize - h) if h <= tilesize else ((h - tilesize + stride - 1) // stride) * stride + tilesize - h
+            pad_w = (tilesize - w) if w <= tilesize else ((w - tilesize + stride - 1) // stride) * stride + tilesize - w
+
+            new_w = w + pad_w
+            new_h = h + pad_h
+
+            new_img = Image.new(img.mode, (new_w, new_h), color=0)
+            new_img.paste(img, (0, 0))
+            return new_img
+        
+        img = adaptive_pad(upsampled_img, tilesize=tilesize * 8, stride=tile_stride * 8)
+        prompt = prompt or """High Contrast, hyper detailed photo, 2k UHD"""
+
+        return self.infer(
             prompt=prompt,
-            negative_prompt=negative_prompt,
-            height=height,
-            width=width,
-            num_inference_steps=num_inference_steps,
-            sigmas=sigmas,
-            guidance_scale=guidance_scale,
-            num_images_per_prompt=num_images_per_prompt,
-            generator=generator,
-            true_cfg_scale=true_cfg_scale,
-            max_sequence_length=max_sequence_length,
-            prompt_embeds=prompt_embeds,
-            prompt_embeds_mask=prompt_embeds_mask,
-            negative_prompt_embeds=negative_prompt_embeds,
-            negative_prompt_embeds_mask=negative_prompt_embeds_mask,
-            latents=latents,
-            attention_kwargs=attention_kwargs,
-            callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+            negative_prompt="",
+            upsampled_img=upsampled_img,
+            condition_image=img,
+            cfg_scale=1.0,
+            fidelity=fidelity,
+            tiled=True,
+            tile_size=tilesize,
+            tile_stride=tile_stride,
+            w_desti=w_desti,
+            h_desti=h_desti,
         )
 
-        latents = self.diffuse(
-            ctx["prompt_embeds"],
-            ctx["prompt_embeds_mask"],
-            ctx["negative_prompt_embeds"],
-            ctx["negative_prompt_embeds_mask"],
-            ctx["latents"],
-            ctx["img_shapes"],
-            ctx["txt_seq_lens"],
-            ctx["negative_txt_seq_lens"],
-            ctx["timesteps"],
-            ctx["do_true_cfg"],
-            ctx["guidance"],
-            true_cfg_scale,
-            image_latents=None,
-            cfg_normalize=True,
-            additional_transformer_kwargs={
-                "return_dict": False,
-                "attention_kwargs": self.attention_kwargs,
-            },
-        )
 
-        self._current_timestep = None
-        return self._decode_latents(latents, height, width, output_type)
+
+
+        # raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+
+        # assert False  
+
+        # height = req.sampling_params.height or self.default_sample_size * self.vae_scale_factor
+        # width = req.sampling_params.width or self.default_sample_size * self.vae_scale_factor
+        # num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        # sigmas = req.sampling_params.sigmas or sigmas
+        # max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
+        # generator = req.sampling_params.generator or generator
+        # true_cfg_scale = req.sampling_params.true_cfg_scale or true_cfg_scale
+        # if req.sampling_params.guidance_scale_provided:
+        #     guidance_scale = req.sampling_params.guidance_scale
+        # num_images_per_prompt = (
+        #     req.sampling_params.num_outputs_per_prompt
+        #     if req.sampling_params.num_outputs_per_prompt > 0
+        #     else num_images_per_prompt
+        # )
+
+        # ctx = self._prepare_generation_context(
+        #     prompt=prompt,
+        #     negative_prompt=negative_prompt,
+        #     height=height,
+        #     width=width,
+        #     num_inference_steps=num_inference_steps,
+        #     sigmas=sigmas,
+        #     guidance_scale=guidance_scale,
+        #     num_images_per_prompt=num_images_per_prompt,
+        #     generator=generator,
+        #     true_cfg_scale=true_cfg_scale,
+        #     max_sequence_length=max_sequence_length,
+        #     prompt_embeds=prompt_embeds,
+        #     prompt_embeds_mask=prompt_embeds_mask,
+        #     negative_prompt_embeds=negative_prompt_embeds,
+        #     negative_prompt_embeds_mask=negative_prompt_embeds_mask,
+        #     latents=latents,
+        #     attention_kwargs=attention_kwargs,
+        #     callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+        # )
+
+        # latents = self.diffuse(
+        #     ctx["prompt_embeds"],
+        #     ctx["prompt_embeds_mask"],
+        #     ctx["negative_prompt_embeds"],
+        #     ctx["negative_prompt_embeds_mask"],
+        #     ctx["latents"],
+        #     ctx["img_shapes"],
+        #     ctx["txt_seq_lens"],
+        #     ctx["negative_txt_seq_lens"],
+        #     ctx["timesteps"],
+        #     ctx["do_true_cfg"],
+        #     ctx["guidance"],
+        #     true_cfg_scale,
+        #     image_latents=None,
+        #     cfg_normalize=True,
+        #     additional_transformer_kwargs={
+        #         "return_dict": False,
+        #         "attention_kwargs": self.attention_kwargs,
+        #     },
+        # )
+
+        # self._current_timestep = None
+        # return self._decode_latents(latents, height, width, output_type)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        weight_dtype = torch.bfloat16
+
+        pretrained_qwen_path = f"{self.od_config.model}"
+        trained_ckpt = f"{self.od_config.model}/ODTSR/weight.pth"
+
+        sd_safe_tensor_path_json_format = f'''[
+            [
+                "{pretrained_qwen_path}/transformer/diffusion_pytorch_model-00001-of-00009.safetensors",
+                "{pretrained_qwen_path}/transformer/diffusion_pytorch_model-00002-of-00009.safetensors",
+                "{pretrained_qwen_path}/transformer/diffusion_pytorch_model-00003-of-00009.safetensors",
+                "{pretrained_qwen_path}/transformer/diffusion_pytorch_model-00004-of-00009.safetensors",
+                "{pretrained_qwen_path}/transformer/diffusion_pytorch_model-00005-of-00009.safetensors",
+                "{pretrained_qwen_path}/transformer/diffusion_pytorch_model-00006-of-00009.safetensors",
+                "{pretrained_qwen_path}/transformer/diffusion_pytorch_model-00007-of-00009.safetensors",
+                "{pretrained_qwen_path}/transformer/diffusion_pytorch_model-00008-of-00009.safetensors",
+                "{pretrained_qwen_path}/transformer/diffusion_pytorch_model-00009-of-00009.safetensors"
+            ],
+            [
+                "{pretrained_qwen_path}/text_encoder/model-00001-of-00004.safetensors",
+                "{pretrained_qwen_path}/text_encoder/model-00002-of-00004.safetensors",
+                "{pretrained_qwen_path}/text_encoder/model-00003-of-00004.safetensors",
+                "{pretrained_qwen_path}/text_encoder/model-00004-of-00004.safetensors"
+            ],
+            "{pretrained_qwen_path}/vae/diffusion_pytorch_model.safetensors"
+        ]'''
+
+        self.model = Generator(
+            torch_dtype = torch.bfloat16,
+            pretrained_weights=sd_safe_tensor_path_json_format,
+            tokenizer_path = f"{pretrained_qwen_path}/tokenizer",
+            learning_rate=0,
+            use_gradient_checkpointing=False,
+            pretrained_ckpt_path_gen=trained_ckpt
+        )
+        self.model = self.model.to(device="cuda")
+        self.model.device = next(self.model.parameters()).device
+        self.model.pipe.device = self.model.device
+        # loader = AutoWeightsLoader(self)
+        # return loader.load_weights(weights)
+        # loaded_weights = loader.load_weights(weights)
+        
+
+
+
+
+        # print(f"[start] load lora weight")
+        # self.lora_state_dict = torch.load(f"{self.od_config.model}/ODTSR/weight.pth", map_location='cpu')
+        # self.lora_state_dict_remove_prefix = {}
+        # for k, v in self.lora_state_dict.items():
+        #     name, module = k, v
+        #     if k.startswith("pipe.dit."):
+        #         name = k[len("pipe.dit."):]
+        #         # self.lora_state_dict_remove_prefix[k[len("pipe.dit."):]] = v
+        #     elif k.startswith("pipe."):
+        #         name = k[len("pipe."):]
+        #         # self.lora_state_dict_remove_prefix[k[len("pipe."):]] = v
+        #     # else:
+        #     #     self.lora_state_dict_remove_prefix[k] = v
+        #     if "attn.to_q.lora" in name:
+        #         name = name.replace("attn.to_q.lora", "attn.to_qkv.q_lora")
+        #     if "attn.to_k.lora" in name:
+        #         name = name.replace("attn.to_k.lora", "attn.to_qkv.k_lora")
+        #     if "attn.to_v.lora" in name:
+        #         name = name.replace("attn.to_v.lora", "attn.to_qkv.v_lora")
+        #     if "to_out.0" in name:
+        #         name = name.replace("to_out.0", "to_out")
+            
+        #     self.lora_state_dict_remove_prefix[name] = module
+
+        # print(f"[end] load lora weight")
+        
+
+
+
+
+        # print(f"[start] linear of dit -> dual_lora linear")
+        # self.add_custom_dual_lora(self.transformer, lora_rank=self.lora_rank)
+        # print(f"[end] linear of dit -> dual_lora linear")
+
+
+
+
+        # # total = 0
+        # def replace_lora_module(parent, name_prefix=""):
+        #     total = 0
+        #     for name, module in parent.named_children():
+        #         full_name = f"{name_prefix}{name}"
+        #         if full_name + ".weight" in self.lora_state_dict_remove_prefix.keys():
+        #             print(f"[replace_lora_module]: {full_name}")
+        #             total = total + 1
+        #             module.weight.data = self.lora_state_dict_remove_prefix[full_name + ".weight"]
+        #         else:
+        #             # print(f"[no replace_lora_module]: {full_name}")
+        #             total = total + replace_lora_module(module, full_name + ".")
+        #     return total
+        # print(f"[start] replace_lora_module")
+        # total = replace_lora_module(self.transformer)
+        # print(f"[end] replace_lora_module")
+        # print(f"total: {total}")
+
+
+        return set()
