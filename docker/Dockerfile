@@ -6,18 +6,22 @@ WORKDIR ${APP_DIR}
 COPY . .
 
 # Install system dependencies
-RUN apt-get update && \
+RUN export https_proxy=http://10.7.4.2:3128 && export http_proxy=http://10.7.4.2:3128 && \
+    apt-get update && \
     apt-get install -y espeak-ng ffmpeg git sox libsox-fmt-all jq && \
     apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* && \
+    unset https_proxy && unset http_proxy
 
-RUN uv pip install --system ".[dev]" && \
+RUN export https_proxy=http://10.7.4.2:3128 && export http_proxy=http://10.7.4.2:3128 && \
+    uv pip install --system ".[dev]" && \
     cd /workspace/vllm-omni/ODTSR && \
-    uv pip install setuptools==81.0.0 && \
-    uv pip install -e . --no-build-isolation && \
-    uv pip install basicsr && \
-    uv pip install nvitop && \
-    sed -i '8s/from torchvision.transforms.functional_tensor import rgb_to_grayscale/from torchvision.transforms._functional_tensor import rgb_to_grayscale/' /usr/local/lib/python3.12/dist-packages/basicsr/data/degradations.py
+    uv pip install --system setuptools==81.0.0 && \
+    uv pip install --system -e . --no-build-isolation && \
+    uv pip install --system basicsr && \
+    uv pip install --system nvitop && \
+    sed -i '8s/from torchvision.transforms.functional_tensor import rgb_to_grayscale/from torchvision.transforms._functional_tensor import rgb_to_grayscale/' /usr/local/lib/python3.12/dist-packages/basicsr/data/degradations.py && \
+    unset https_proxy && unset http_proxy
 
 
 
