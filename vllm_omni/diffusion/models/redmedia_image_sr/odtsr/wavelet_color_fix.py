@@ -46,7 +46,7 @@ def wavelet_color_fix(
 
     # Apply wavelet reconstruction
     result_tensor = wavelet_reconstruction(target_tensor, source_tensor)
-    print(f"result_tensor: {result_tensor.shape}")
+    # print(f"result_tensor: {result_tensor.shape} {result_tensor.dtype}")
 
     # Convert tensor back to image
     if return_type == "Image":

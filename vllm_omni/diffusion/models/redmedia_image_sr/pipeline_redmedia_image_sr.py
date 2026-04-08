@@ -1244,10 +1244,13 @@ class RedMediaImageSRPipeline(nn.Module, RedMediaImageSRCFGParallelMixin, Diffus
                 tile_size = tile_size,
                 tile_stride = tile_stride
             )
-            print(f"res_img: {res_img.shape}")
+            # print(f"res_img: {res_img.shape}")
             cropped_image = res_img[:, :, :h_desti, :w_desti]
-            output_pil = wavelet_color_fix(target=cropped_image, source=upsampled_img, return_type="Tensor")
-
+            # print(f"cropped_image: {cropped_image.shape} {cropped_image.dtype}")
+            output_pil = cropped_image
+            # output_pil = wavelet_color_fix(target=cropped_image, source=upsampled_img, return_type="Tensor")
+            # print(f"output_pil: {output_pil.shape} {output_pil.dtype}")
+            # output_pil = output_pil.to(dtype=cropped_image.dtype)
         return DiffusionOutput(
             output=output_pil,
             stage_durations=None,
