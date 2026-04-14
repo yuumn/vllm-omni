@@ -1401,7 +1401,7 @@ async def edit_images(
     image_array: list[UploadFile] | None = File(None, alias="image[]"),
     url: list[str] | None = Form(None),
     url_array: list[str] | None = Form(None, alias="url[]"),
-    prompt: str = Form(...),
+    prompt: str = Form("High Contrast, hyper detailed photo, 2k UHD"),
     model: str = Form(None),
     n: int = Form(1),
     size: str = Form("auto"),
@@ -1432,6 +1432,7 @@ async def edit_images(
     print(f"raw_request: {raw_request}")
     print(f"scale: {scale}")
     print(f"fidelity: {fidelity}")
+    print(f"prompt: {prompt}")
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
     if model is not None and model != model_name:
         logger.warning(
@@ -1445,6 +1446,9 @@ async def edit_images(
             detail="Only response_format 'b64_json' is supported now.",
         )
     try:
+        if prompt == "":
+            prompt = "High Contrast, hyper detailed photo, 2k UHD"
+
         # 2. Build prompt & images params
         prompt: OmniTextPrompt = {"prompt": prompt}
         if negative_prompt is not None:
@@ -1453,7 +1457,7 @@ async def edit_images(
         images = image or image_array
         # if isinstance(images, list):
         #     images = images[0]
-        
+
         # contents = await images.read()
         # images = Image.open(io.BytesIO(contents))
         # print(f"images: {images} {type(images)}")
